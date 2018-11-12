@@ -1,12 +1,15 @@
 package daemon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-systemd/login1"
 	ignv2_2types "github.com/coreos/ignition/config/v2_2/types"
@@ -17,10 +20,11 @@ import (
 	mcfgclientset "github.com/openshift/machine-config-operator/pkg/generated/clientset/versioned"
 	mcfgclientv1 "github.com/openshift/machine-config-operator/pkg/generated/clientset/versioned/typed/machineconfiguration.openshift.io/v1"
 	"github.com/vincent-petithory/dataurl"
-	corev1 "k8s.io/api/core/v1"
+	apicorev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	coreinformersv1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
+	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisterv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 )
@@ -151,6 +155,9 @@ func NewClusterDrivenDaemon(
 // responsible for triggering callbacks to handle updates. Successful
 // updates shouldn't return, and should just reboot the node.
 func (dn *Daemon) Run(stop <-chan struct{}) error {
+	glog.Info("Starting Kubelet Healthz Monitor")
+	go runKubeletHealthzMonitor(dn.kubeClient.CoreV1().Nodes(), dn.name, stop)
+
 	// Catch quickly if we've been asked to run once.
 	if dn.onceFrom != "" {
 		glog.V(2).Info("Daemon running once per request")
@@ -269,7 +276,7 @@ func (dn *Daemon) runOnce() error {
 // that means something changed and pass over to execution methods no matter what.
 // Also note that we only care about node updates, not creation or deletion.
 func (dn *Daemon) handleNodeUpdate(old, cur interface{}) {
-	node := cur.(*corev1.Node)
+	node := cur.(*apicorev1.Node)
 
 	// First check if the node that was updated is this daemon's node
 	if node.Name == dn.name {
@@ -595,4 +602,58 @@ func ValidPath(path string) bool {
 		}
 	}
 	return false
+}
+
+const (
+	kubeletHealthzEndpoint         = "http://localhost:10248/healthz"
+	kubeletHealthzPollingInterval  = time.Duration(30 * time.Second)
+	kubeletHealthzTimeout          = time.Duration(30 * time.Second)
+	kubeletHealthzFailureThreshold = 3
+)
+
+func runKubeletHealthzMonitor(client corev1.NodeInterface, node string, stop <-chan struct{}) {
+	failureCount := 0
+	for {
+		select {
+		case <-stop:
+			return
+		case <-time.After(kubeletHealthzPollingInterval):
+			if err := getHealth(); err != nil {
+				glog.Warningf("Failed kubelet health check: %v", err)
+				failureCount++
+				if failureCount >= kubeletHealthzFailureThreshold {
+					glog.Error("Kubelet health failure threshold reached. Marking degraded.")
+					setUpdateDegraded(client, node)
+				}
+			} else {
+				failureCount = 0 // reset failure count on success
+			}
+		}
+	}
+}
+func getHealth() error {
+	glog.V(2).Info("Kubelet health running")
+	ctx, cancel := context.WithTimeout(context.Background(), kubeletHealthzTimeout)
+	defer cancel()
+	req, err := http.NewRequest("GET", kubeletHealthzEndpoint, nil)
+	if err != nil {
+		return err
+	}
+	req = req.WithContext(ctx)
+	client := http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if string(respData) != "ok" {
+		glog.Warningf("Kubelet Healthz Endpoint returned: %s", string(respData))
+		return errors.New("Kubelet health not ok")
+	}
+	glog.V(2).Info("Kubelet health ok")
+	return nil
 }
